@@ -83,14 +83,30 @@ tabcount uninstall                       # remove LaunchAgent (keeps data)
 
 By default `tabcount plot` opens **two separate windows** — one for tab
 counts, one for window counts — so each can be saved (PNG/PDF/SVG via the
-toolbar's save button) independently. Each window has two checkboxes:
+toolbar's save button) independently. Each window has four checkboxes:
 
-- **Log Y** — toggle linear/log on the y-axis live.
+- **Log Y** — toggle linear/log on the primary y-axis live.
 - **Log X (since now)** — switch the x-axis from absolute time to
   "hours since now" on a log scale (newer on the right). Useful for
   expanding recent history while keeping older data on screen.
+- **Memory (%)** — overlay per-browser memory on a right y-axis as
+  percent of total system RAM (0–100 range).
+- **Memory (GB)** — same overlay, but absolute GB with autoscaling.
+  Mutually exclusive with Memory (%).
 
-Pan/zoom/save controls come from the standard matplotlib toolbar.
+Memory comes from summing RSS across each browser's renderer/helper
+subprocesses. Chrome and Firefox are precise (their helpers are real
+children of the main app, found by a process-tree walk). Safari and
+DuckDuckGo are approximate: WebKit content/networking/GPU XPC services
+are launchd-spawned (not children), so they're matched by name and
+attributed by which WebKit-using browser is running — if both Safari and
+DDG are running, the WebKit total is split by main-app RSS ratio. Other
+WebKit-using apps (Mail, Messages) cause a small overcount. RSS itself
+double-counts shared memory pages. Trends are accurate; absolute numbers
+are within ±20–30 % of Activity Monitor's "Memory" column.
+
+Pan/zoom/save controls come from the standard matplotlib toolbar. The
+checkbox panel is hidden automatically when saving (PNG/PDF/SVG).
 
 ## Data
 

@@ -31,7 +31,17 @@ PLIST_TEMPLATE = REPO_DIR / "com.cohm.tabcount.plist.template"
 PLIST_LABEL = "com.cohm.tabcount"
 
 BROWSERS = ["safari", "chrome", "firefox", "duckduckgo"]
-CSV_HEADER = ["ts", "browser", "status", "windows", "total_tabs", "tabs_per_window"]
+CSV_HEADER = ["ts", "browser", "status", "windows", "total_tabs",
+              "tabs_per_window", "rss_kb"]
+
+# Substring matched against each process's executable path in `ps -axo command`.
+# Catches all renderer/helper/GPU subprocesses of each browser.
+BROWSER_APP_PATH = {
+    "safari": "/Safari.app/",
+    "chrome": "/Google Chrome.app/",
+    "firefox": "/Firefox.app/",
+    "duckduckgo": "/DuckDuckGo.app/",
+}
 
 # ProcessName as it appears in `ps`/pgrep -x.
 PROCESS_NAMES = {
@@ -74,6 +84,112 @@ def is_running(process_name: str) -> bool:
         return r.returncode == 0
     except Exception:
         return False
+
+
+def system_ram_bytes() -> int:
+    try:
+        r = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True, text=True, timeout=2,
+        )
+        return int(r.stdout.strip())
+    except Exception:
+        return 0
+
+
+def memory_by_browser() -> dict[str, int]:
+    """Sum RSS (KB) per browser.
+
+    Chrome / Firefox: walk the process tree from each main-app process and
+    sum all descendants (precise — helpers are real children).
+
+    Safari / DuckDuckGo: WebKit content/networking/GPU XPC services are
+    launchd-spawned, not children of the browser, so the tree walk misses
+    them. We sum the WebKit XPC processes separately and attribute them to
+    whichever WebKit-using browser is running; if both, split by ratio of
+    main-app RSS. Other WebKit-using apps (Mail, Messages, ...) cause a
+    small overcount.
+    """
+    totals = {b: 0 for b in BROWSERS}
+    try:
+        r = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,ppid=,rss=,command="],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return totals
+
+    info: dict[int, tuple[int, int, str]] = {}
+    for line in r.stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        parts = s.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            rss = int(parts[2])
+        except ValueError:
+            continue
+        info[pid] = (ppid, rss, parts[3])
+
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _, _) in info.items():
+        children.setdefault(ppid, []).append(pid)
+
+    def descendants(roots: list[int]) -> set[int]:
+        seen: set[int] = set()
+        stack = list(roots)
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            stack.extend(children.get(pid, []))
+        return seen
+
+    main_pids: dict[str, list[int]] = {b: [] for b in BROWSERS}
+    main_rss: dict[str, int] = {b: 0 for b in BROWSERS}
+    for pid, (_, rss, cmd) in info.items():
+        for b, marker in BROWSER_APP_PATH.items():
+            if marker in cmd:
+                main_pids[b].append(pid)
+                main_rss[b] += rss
+                break
+
+    counted: set[int] = set()
+    for b in BROWSERS:
+        for pid in descendants(main_pids[b]):
+            if pid not in counted:
+                totals[b] += info[pid][1]
+                counted.add(pid)
+
+    webkit_markers = ("com.apple.WebKit.WebContent",
+                      "com.apple.WebKit.Networking",
+                      "com.apple.WebKit.GPU")
+    webkit_total = 0
+    for pid, (_, rss, cmd) in info.items():
+        if pid in counted:
+            continue
+        if any(m in cmd for m in webkit_markers):
+            webkit_total += rss
+            counted.add(pid)
+
+    safari_run = main_rss["safari"] > 0
+    ddg_run = main_rss["duckduckgo"] > 0
+    if safari_run and ddg_run:
+        denom = main_rss["safari"] + main_rss["duckduckgo"]
+        safari_share = int(webkit_total * main_rss["safari"] / denom)
+        totals["safari"] += safari_share
+        totals["duckduckgo"] += webkit_total - safari_share
+    elif safari_run:
+        totals["safari"] += webkit_total
+    elif ddg_run:
+        totals["duckduckgo"] += webkit_total
+
+    return totals
 
 
 # ---- AppleScript helpers --------------------------------------------------
@@ -260,12 +376,14 @@ SAMPLERS = {
 
 def gather_samples() -> list[list]:
     ts = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    mem = memory_by_browser()
     rows: list[list] = []
     for b in BROWSERS:
         try:
             r = SAMPLERS[b]()
         except Exception as e:
             r = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        rss = mem.get(b, 0)
         if r["status"] == "ok":
             total = r.get("total_tabs")
             rows.append([
@@ -273,12 +391,13 @@ def gather_samples() -> list[list]:
                 r["windows"],
                 "" if total is None else total,
                 "|".join(str(x) for x in r["tabs_per_window"]),
+                rss,
             ])
         elif r["status"] == "not_running":
-            rows.append([ts, b, "not_running", "", "", ""])
+            rows.append([ts, b, "not_running", "", "", "", rss])
         else:
             print(f"[{b}] error: {r.get('error', '')}", file=sys.stderr)
-            rows.append([ts, b, "error", "", "", ""])
+            rows.append([ts, b, "error", "", "", "", rss])
     return rows
 
 
@@ -297,11 +416,29 @@ def rotate_old_months() -> None:
         p.unlink()
 
 
+def _migrate_csv(path: Path, new_header: list[str]) -> None:
+    """Rewrite a CSV in place to use new_header. Missing columns become ""."""
+    with path.open("r", newline="") as f:
+        existing = list(csv.DictReader(f))
+    tmp = path.with_suffix(".csv.tmp")
+    with tmp.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=new_header)
+        w.writeheader()
+        for row in existing:
+            w.writerow({k: row.get(k, "") for k in new_header})
+    tmp.replace(path)
+
+
 def append_rows(rows: list[list]) -> Path:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     rotate_old_months()
     month = datetime.now().strftime("%Y-%m")
     csv_path = DATA_DIR / f"{month}.csv"
+    if csv_path.exists():
+        with csv_path.open("r", newline="") as f:
+            existing_header = next(csv.reader(f), [])
+        if existing_header != CSV_HEADER:
+            _migrate_csv(csv_path, CSV_HEADER)
     new = not csv_path.exists()
     with csv_path.open("a", newline="") as f:
         w = csv.writer(f)
@@ -344,9 +481,10 @@ def read_data_since(cutoff: datetime) -> dict[str, list[dict]]:
                     continue
                 result[b].append({
                     "ts": ts,
-                    "status": row["status"],
-                    "windows": int(row["windows"]) if row["windows"] else None,
-                    "total_tabs": int(row["total_tabs"]) if row["total_tabs"] else None,
+                    "status": row.get("status", ""),
+                    "windows": int(row["windows"]) if row.get("windows") else None,
+                    "total_tabs": int(row["total_tabs"]) if row.get("total_tabs") else None,
+                    "rss_kb": int(row["rss_kb"]) if row.get("rss_kb") else None,
                 })
     return result
 
@@ -365,7 +503,7 @@ def cmd_sample(args) -> None:
 def cmd_status(args) -> None:
     rows = gather_samples()
     width = max(len(b) for b in BROWSERS)
-    for ts, b, status, nwin, ntabs, per in rows:
+    for ts, b, status, nwin, ntabs, per, rss in rows:
         if status == "ok":
             if ntabs == "":
                 detail = f"{nwin} window(s), tabs unavailable"
@@ -375,13 +513,15 @@ def cmd_status(args) -> None:
                     detail += f"  [{per}]"
         else:
             detail = status
+        if isinstance(rss, int) and rss > 0:
+            detail += f"  ~{rss / 1024:.0f} MB RSS"
         print(f"{b.ljust(width)}  {detail}")
 
 
 def _make_metric_figure(metric_field: str, label: str, data: dict,
-                        browsers: list[str]):
-    """Build a figure for a single metric with live log-toggle checkboxes.
-    Returns the figure (and keeps the CheckButtons widget alive on it)."""
+                        browsers: list[str], ram_bytes: int):
+    """Figure for one metric with live checkboxes for log scales and an
+    optional memory overlay on a right y-axis (in % of system RAM, or GB)."""
     import matplotlib.pyplot as plt
     import matplotlib.font_manager as fm
     from matplotlib.dates import AutoDateFormatter, AutoDateLocator
@@ -400,45 +540,131 @@ def _make_metric_figure(metric_field: str, label: str, data: dict,
     except Exception:
         pass
 
-    ax = fig.add_axes((0.07, 0.12, 0.76, 0.78))
-    cb_ax = fig.add_axes((0.85, 0.50, 0.13, 0.16))
+    ax = fig.add_axes((0.07, 0.12, 0.68, 0.78))
+    mem_ax = ax.twinx()
+    mem_ax.set_visible(False)
+
+    cb_ax = fig.add_axes((0.85, 0.38, 0.14, 0.34))
     cb_ax.set_axis_off()
 
-    state = {"logy": False, "logx_time": False}
+    # mem_mode: None | "percent" | "gb"
+    state = {"logy": False, "logx_time": False, "mem_mode": None}
     now = datetime.now(timezone.utc).astimezone()
+
+    def _rss_to_y(rss_kb: int) -> float:
+        if state["mem_mode"] == "percent":
+            if ram_bytes <= 0:
+                return float("nan")
+            return rss_kb * 1024.0 / ram_bytes * 100.0
+        return rss_kb / (1024.0 * 1024.0)  # GB
+
+    def _pick_legend_loc() -> str:
+        """Pick legend placement by binning data points into a 3x3 grid
+        across both axes. Considers 4 corners + center-left/right; skips the
+        chart middle and top/bottom-center (usually bad spots)."""
+        import math
+
+        def to_frac(value: float, lo: float, hi: float, scale: str) -> float:
+            if scale == "log" and lo > 0 and hi > 0 and value > 0:
+                return ((math.log(value) - math.log(lo))
+                        / (math.log(hi) - math.log(lo)))
+            if hi == lo:
+                return 0.5
+            return (value - lo) / (hi - lo)
+
+        x_lo, x_hi = ax.get_xlim()
+        if x_lo > x_hi:
+            x_lo, x_hi = x_hi, x_lo
+        y_lo, y_hi = ax.get_ylim()
+        if y_lo > y_hi:
+            y_lo, y_hi = y_hi, y_lo
+        x_scale = ax.get_xscale()
+        y_scale = ax.get_yscale()
+
+        grid = {(c, r): 0 for c in ("L", "C", "R") for r in ("B", "M", "T")}
+
+        def tally(lines, src_lo: float, src_hi: float, src_scale: str) -> None:
+            for line in lines:
+                for x, y in line.get_xydata():
+                    if not (x == x and y == y):
+                        continue
+                    xf = to_frac(x, x_lo, x_hi, x_scale)
+                    yf = to_frac(y, src_lo, src_hi, src_scale)
+                    xf = max(0.0, min(1.0, xf))
+                    yf = max(0.0, min(1.0, yf))
+                    col = "L" if xf < 1 / 3 else ("R" if xf >= 2 / 3 else "C")
+                    row = "B" if yf < 1 / 3 else ("T" if yf >= 2 / 3 else "M")
+                    grid[(col, row)] += 1
+
+        tally(ax.get_lines(), y_lo, y_hi, y_scale)
+        if state["mem_mode"] is not None:
+            m_lo, m_hi = mem_ax.get_ylim()
+            if m_lo > m_hi:
+                m_lo, m_hi = m_hi, m_lo
+            tally(mem_ax.get_lines(), m_lo, m_hi, mem_ax.get_yscale())
+
+        candidates = {
+            ("L", "T"): "upper left",
+            ("R", "T"): "upper right",
+            ("L", "B"): "lower left",
+            ("R", "B"): "lower right",
+            ("L", "M"): "center left",
+            ("R", "M"): "center right",
+        }
+        best = min(candidates.keys(), key=lambda k: grid[k])
+        return candidates[best]
 
     def redraw() -> None:
         ax.clear()
+        mem_ax.clear()
+        # ax.clear() on a twinx axes resets the right-side configuration;
+        # re-apply so ticks and label render on the right, not the left.
+        mem_ax.yaxis.tick_right()
+        mem_ax.yaxis.set_label_position("right")
         any_data = False
+
         for b in browsers:
             rows = data.get(b, [])
             if not rows:
                 continue
+            if state["logx_time"]:
+                xs = [max(1.0 / 60.0,
+                          (now - r["ts"]).total_seconds() / 3600.0)
+                      for r in rows]
+            else:
+                xs = [r["ts"] for r in rows]
+
             ys = [
                 r[metric_field]
                 if r["status"] == "ok" and r[metric_field] is not None
                 else float("nan")
                 for r in rows
             ]
-            if state["logx_time"]:
-                # 1 minute floor so the most recent sample doesn't go to log(0).
-                xs = [max(1.0 / 60.0,
-                          (now - r["ts"]).total_seconds() / 3600.0)
-                      for r in rows]
-            else:
-                xs = [r["ts"] for r in rows]
-            if any(y == y for y in ys):  # at least one non-NaN
+            if any(y == y for y in ys):
                 any_data = True
             ax.plot(xs, ys, label=BROWSER_LABELS.get(b, b),
                     color=BROWSER_COLORS.get(b),
                     linewidth=1.5, marker=".", markersize=3)
 
+            if state["mem_mode"] is not None:
+                mem_ys = [
+                    _rss_to_y(r["rss_kb"])
+                    if r.get("rss_kb") and r["rss_kb"] > 0
+                    else float("nan")
+                    for r in rows
+                ]
+                mem_ax.plot(xs, mem_ys, color=BROWSER_COLORS.get(b),
+                            linestyle="--", linewidth=1.2, alpha=0.75,
+                            label="_nolegend_")
+
         if state["logx_time"]:
             ax.set_xscale("log")
-            ax.invert_xaxis()  # newer (smaller dt) on the right
+            ax.invert_xaxis()
+            mem_ax.set_xscale("log")
             ax.set_xlabel("Hours since now (log)")
         else:
             ax.set_xscale("linear")
+            mem_ax.set_xscale("linear")
             loc = AutoDateLocator()
             ax.xaxis.set_major_locator(loc)
             ax.xaxis.set_major_formatter(AutoDateFormatter(loc))
@@ -448,26 +674,52 @@ def _make_metric_figure(metric_field: str, label: str, data: dict,
         ax.set_yscale("log" if state["logy"] else "linear")
         ax.set_ylabel(label)
         ax.grid(True, which="both", alpha=0.3)
+
+        if state["mem_mode"] is not None:
+            mem_ax.set_visible(True)
+            if state["mem_mode"] == "percent":
+                mem_ax.set_ylim(0, 100)
+                mem_ax.set_ylabel("Memory (% of RAM)")
+            else:
+                mem_ax.set_ylabel("Memory (GB)")
+        else:
+            mem_ax.set_visible(False)
+
         if any_data:
-            ax.legend(loc="best")
+            ax.legend(loc=_pick_legend_loc())
         fig.canvas.draw_idle()
 
-    cb = CheckButtons(cb_ax,
-                      ["Log Y", "Log X (since now)"],
-                      [state["logy"], state["logx_time"]])
+    labels = ["Log Y", "Log X (since now)", "Memory (%)", "Memory (GB)"]
+    cb = CheckButtons(cb_ax, labels, [False, False, False, False])
+
+    _busy = [False]
 
     def on_click(label_clicked: str) -> None:
-        if label_clicked == "Log Y":
-            state["logy"] = not state["logy"]
-        else:
-            state["logx_time"] = not state["logx_time"]
+        if _busy[0]:
+            return
+        _busy[0] = True
+        try:
+            status = cb.get_status()
+            state["logy"] = status[0]
+            state["logx_time"] = status[1]
+            pct, gb = status[2], status[3]
+            if pct and gb:
+                # Mutual exclusion: keep the just-clicked one, turn off the other.
+                if label_clicked == "Memory (%)":
+                    cb.set_active(3)
+                    pct, gb = True, False
+                else:
+                    cb.set_active(2)
+                    pct, gb = False, True
+            state["mem_mode"] = "percent" if pct else ("gb" if gb else None)
+        finally:
+            _busy[0] = False
         redraw()
 
     cb.on_clicked(on_click)
-    fig._tabcount_widgets = cb  # keep widget alive
+    fig._tabcount_widgets = cb
 
-    # Wrap savefig so exports (PNG/PDF/...) don't include the checkbox panel.
-    # The matplotlib toolbar's save button routes through fig.savefig().
+    # Hide the checkbox panel during savefig (toolbar save routes through here).
     original_savefig = fig.savefig
 
     def savefig_without_widgets(*args, **kwargs):
@@ -492,14 +744,15 @@ def cmd_plot(args) -> None:
     cutoff = datetime.now(timezone.utc).astimezone() - horizon
     browsers = args.browsers.split(",") if args.browsers else BROWSERS
     data = read_data_since(cutoff)
+    ram_bytes = system_ram_bytes()
 
     figs = []
     if args.metric in ("tabs", "both"):
         figs.append(_make_metric_figure(
-            "total_tabs", "Tabs", data, browsers))
+            "total_tabs", "Tabs", data, browsers, ram_bytes))
     if args.metric in ("windows", "both"):
         figs.append(_make_metric_figure(
-            "windows", "Windows", data, browsers))
+            "windows", "Windows", data, browsers, ram_bytes))
 
     plt.show()
 
