@@ -40,10 +40,21 @@ cd /Users/cohm/Documents/Work/Computing/Projects/tabcounter
 ./tabcount.py install
 ```
 
-This creates a venv at `~/.tabcount/venv/` with `lz4` and `matplotlib`, writes
-the LaunchAgent plist to `~/Library/LaunchAgents/com.cohm.tabcount.plist`,
-and drops a `tabcount` wrapper at `~/bin/tabcount`. Make sure `~/bin` is on
-your `PATH`.
+This creates a venv at `~/.tabcount/venv/` with `lz4` and `matplotlib` and
+writes the LaunchAgent plist to `~/Library/LaunchAgents/com.cohm.tabcount.plist`.
+Nothing is added to `$PATH`.
+
+The script re-execs itself under the venv python on every run, so invoking
+`./tabcount.py …` from any python works once `install` has completed.
+
+### Optional: a shell alias
+
+To call it `tabcount` from anywhere without changing `$PATH`, add this line
+to `~/.zshrc`:
+
+```sh
+alias tabcount='/Users/cohm/Documents/Work/Computing/Projects/tabcounter/tabcount.py'
+```
 
 ### First-run permission grants
 
@@ -52,12 +63,14 @@ prompt to allow automation. Run it from a Terminal once so the prompts appear
 visibly and you can click *OK*:
 
 ```sh
-tabcount status
+./tabcount.py status
 ```
 
 After that the scheduled samples will inherit the grant.
 
 ## Usage
+
+(Examples assume the `tabcount` alias; otherwise substitute the full path.)
 
 ```sh
 tabcount status                          # print current counts, no write
@@ -65,7 +78,7 @@ tabcount sample                          # poll once and append to today's CSV
 tabcount plot                            # interactive window, last 30 days
 tabcount plot --range 7d --metric tabs
 tabcount plot --range 24h --browsers safari,chrome
-tabcount uninstall                       # remove LaunchAgent + wrapper (keeps data)
+tabcount uninstall                       # remove LaunchAgent (keeps data)
 ```
 
 ## Data

@@ -17,9 +17,13 @@ browser per poll. A LaunchAgent runs `tabcount sample` every 5 minutes.
   - `~/.tabcount/venv/` — Python venv with `lz4` and `matplotlib`
   - `~/.tabcount/tabcount.log` — launchd stderr
 - LaunchAgent: `~/Library/LaunchAgents/com.cohm.tabcount.plist`
-- CLI wrapper: `~/bin/tabcount`
 
 The split keeps the repo free of data and lets the install be reproducible.
+
+`tabcount.py` re-execs itself under `~/.tabcount/venv/bin/python` on every
+run (see `_maybe_reexec_under_venv`), so any invocation — direct `./tabcount.py`,
+shell alias, or `launchd` — uses the venv's interpreter automatically once
+`install` has run. Nothing is added to `$PATH`.
 
 ## Per-browser polling — how and why
 

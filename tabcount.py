@@ -30,8 +30,6 @@ PLIST_PATH = HOME / "Library" / "LaunchAgents" / "com.cohm.tabcount.plist"
 PLIST_TEMPLATE = REPO_DIR / "com.cohm.tabcount.plist.template"
 PLIST_LABEL = "com.cohm.tabcount"
 
-BIN_PATH = HOME / "bin" / "tabcount"
-
 BROWSERS = ["safari", "chrome", "firefox", "duckduckgo"]
 CSV_HEADER = ["ts", "browser", "status", "windows", "total_tabs", "tabs_per_window"]
 
@@ -425,17 +423,6 @@ def _setup_venv() -> None:
                     "lz4", "matplotlib"], check=True)
 
 
-def _write_wrapper() -> None:
-    BIN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    wrapper = (
-        "#!/bin/sh\n"
-        f'exec "{VENV_DIR / "bin" / "python"}" '
-        f'"{REPO_DIR / "tabcount.py"}" "$@"\n'
-    )
-    BIN_PATH.write_text(wrapper)
-    BIN_PATH.chmod(0o755)
-
-
 def cmd_install(args) -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -449,11 +436,16 @@ def cmd_install(args) -> None:
                        capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit(f"launchctl bootstrap failed: {r.stderr.strip()}")
-    _write_wrapper()
+    script_path = REPO_DIR / "tabcount.py"
     print("Installed.")
     print(f"  LaunchAgent: {PLIST_PATH}  (every 5 min)")
-    print(f"  CLI:         {BIN_PATH}")
     print(f"  Data dir:    {DATA_DIR}")
+    print()
+    print("Invoke directly:")
+    print(f"  {script_path} status")
+    print()
+    print("Or add a shell alias (paste into ~/.zshrc):")
+    print(f"  alias tabcount='{script_path}'")
     print()
     print("First-run note: macOS will prompt you to allow automation of")
     print("Safari / Google Chrome / DuckDuckGo. Run `tabcount status` from")
@@ -466,16 +458,33 @@ def cmd_uninstall(args) -> None:
                    capture_output=True)
     if PLIST_PATH.exists():
         PLIST_PATH.unlink()
-    if BIN_PATH.exists() or BIN_PATH.is_symlink():
-        BIN_PATH.unlink()
-    print(f"Uninstalled launchd job and CLI wrapper.")
+    print(f"Uninstalled launchd job.")
     print(f"Data preserved at {DATA_DIR}.")
     print(f"To fully remove: rm -rf {RUNTIME_DIR}")
 
 
 # ---- main -----------------------------------------------------------------
 
+def _maybe_reexec_under_venv() -> None:
+    """If the venv exists and we're not already running under it, re-exec.
+    This means `./tabcount.py` works regardless of which python invoked it,
+    once `install` has set up ~/.tabcount/venv/."""
+    venv_python = VENV_DIR / "bin" / "python"
+    if not venv_python.exists():
+        return
+    try:
+        current = Path(sys.executable).resolve()
+        target = venv_python.resolve()
+    except OSError:
+        return
+    if current == target:
+        return
+    os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve()),
+                                *sys.argv[1:]])
+
+
 def main() -> None:
+    _maybe_reexec_under_venv()
     p = argparse.ArgumentParser(prog="tabcount", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
