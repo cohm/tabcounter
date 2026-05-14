@@ -55,6 +55,13 @@ BROWSER_COLORS = {
     "duckduckgo": "#de5833",
 }
 
+BROWSER_LABELS = {
+    "safari": "Safari",
+    "chrome": "Chrome",
+    "firefox": "Firefox",
+    "duckduckgo": "Duck Duck Go",
+}
+
 
 # ---- process detection ----------------------------------------------------
 
@@ -87,16 +94,13 @@ def run_osascript(script: str, timeout: float = 8.0) -> tuple[bool, str, str]:
 
 def applescript_tab_counts(app_name: str) -> tuple[bool, list[int], str]:
     """Ask a browser via AppleScript for tab counts per window.
-    Returns (ok, [tabs_per_window], error_message)."""
+    Returns (ok, [tabs_per_window], error_message). Fails if the browser's
+    scripting dictionary doesn't expose `tabs` on windows."""
     script = f'''
     tell application "{app_name}"
         set counts to {{}}
         repeat with w in windows
-            try
-                set end of counts to (count of tabs of w) as text
-            on error
-                set end of counts to "0"
-            end try
+            set end of counts to (count of tabs of w) as text
         end repeat
         set AppleScript's text item delimiters to "|"
         return counts as text
@@ -111,6 +115,19 @@ def applescript_tab_counts(app_name: str) -> tuple[bool, list[int], str]:
         return True, [int(x) for x in out.split("|") if x != ""], ""
     except ValueError:
         return False, [], f"parse: {out!r}"
+
+
+def applescript_window_count(app_name: str) -> tuple[bool, int, str]:
+    """Direct `count of windows` via the app's own AppleScript dict.
+    Used as a fallback when the app exposes windows but not tabs."""
+    script = f'tell application "{app_name}" to return count of windows'
+    ok, out, err = run_osascript(script)
+    if not ok:
+        return False, 0, err
+    try:
+        return True, int(out), ""
+    except ValueError:
+        return False, 0, f"parse: {out!r}"
 
 
 def applescript_window_count_fallback(process_name: str) -> tuple[bool, int, str]:
@@ -167,19 +184,28 @@ def sample_duckduckgo() -> dict:
     if not is_running(PROCESS_NAMES["duckduckgo"]):
         return {"status": "not_running"}
     ok, counts, err = applescript_tab_counts(APP_NAMES["duckduckgo"])
-    if ok:
+    if ok and counts:
         return _result_ok(counts)
-    # AppleScript dictionary may not expose tabs — try UI fallback for at
-    # least a window count. tabs_per_window stays empty in this case.
-    ok2, nwin, err2 = applescript_window_count_fallback(PROCESS_NAMES["duckduckgo"])
-    if ok2 and nwin > 0:
+    # DDG's AppleScript dictionary exposes `windows` but not `tabs`. Fall back
+    # to a windows-only count via DDG's own dict (no System Events needed).
+    ok2, nwin, err2 = applescript_window_count(APP_NAMES["duckduckgo"])
+    if ok2:
         return {
             "status": "ok",
             "windows": nwin,
-            "total_tabs": 0,
+            "total_tabs": None,
             "tabs_per_window": [],
         }
-    return {"status": "error", "error": err or err2}
+    # Last resort: UI scripting via System Events (needs separate permission).
+    ok3, nwin3, err3 = applescript_window_count_fallback(PROCESS_NAMES["duckduckgo"])
+    if ok3:
+        return {
+            "status": "ok",
+            "windows": nwin3,
+            "total_tabs": None,
+            "tabs_per_window": [],
+        }
+    return {"status": "error", "error": err or err2 or err3}
 
 
 def _decompress_mozlz4(blob: bytes) -> bytes:
@@ -241,9 +267,11 @@ def gather_samples() -> list[list]:
         except Exception as e:
             r = {"status": "error", "error": f"{type(e).__name__}: {e}"}
         if r["status"] == "ok":
+            total = r.get("total_tabs")
             rows.append([
                 ts, b, "ok",
-                r["windows"], r["total_tabs"],
+                r["windows"],
+                "" if total is None else total,
                 "|".join(str(x) for x in r["tabs_per_window"]),
             ])
         elif r["status"] == "not_running":
@@ -339,63 +367,140 @@ def cmd_status(args) -> None:
     width = max(len(b) for b in BROWSERS)
     for ts, b, status, nwin, ntabs, per in rows:
         if status == "ok":
-            detail = f"{ntabs} tabs in {nwin} window(s)"
-            if per:
-                detail += f"  [{per}]"
+            if ntabs == "":
+                detail = f"{nwin} window(s), tabs unavailable"
+            else:
+                detail = f"{ntabs} tabs in {nwin} window(s)"
+                if per:
+                    detail += f"  [{per}]"
         else:
             detail = status
         print(f"{b.ljust(width)}  {detail}")
 
 
+def _make_metric_figure(metric_field: str, label: str, data: dict,
+                        browsers: list[str]):
+    """Build a figure for a single metric with live log-toggle checkboxes.
+    Returns the figure (and keeps the CheckButtons widget alive on it)."""
+    import matplotlib.pyplot as plt
+    import matplotlib.font_manager as fm
+    from matplotlib.dates import AutoDateFormatter, AutoDateLocator
+    from matplotlib.widgets import CheckButtons
+
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = ["Figtree"] + plt.rcParamsDefault["font.sans-serif"]
+    if any(f.name == "Figtree" for f in fm.fontManager.ttflist):
+        plt.rcParams["font.size"] = 12
+        plt.rcParams["font.weight"] = "medium"
+        plt.rcParams["axes.labelweight"] = "medium"
+
+    fig = plt.figure(figsize=(11, 7))
+    try:
+        fig.canvas.manager.set_window_title(f"tabcount — {label.lower()}")
+    except Exception:
+        pass
+
+    ax = fig.add_axes((0.07, 0.12, 0.76, 0.78))
+    cb_ax = fig.add_axes((0.85, 0.50, 0.13, 0.16))
+    cb_ax.set_axis_off()
+
+    state = {"logy": False, "logx_time": False}
+    now = datetime.now(timezone.utc).astimezone()
+
+    def redraw() -> None:
+        ax.clear()
+        any_data = False
+        for b in browsers:
+            rows = data.get(b, [])
+            if not rows:
+                continue
+            ys = [
+                r[metric_field]
+                if r["status"] == "ok" and r[metric_field] is not None
+                else float("nan")
+                for r in rows
+            ]
+            if state["logx_time"]:
+                # 1 minute floor so the most recent sample doesn't go to log(0).
+                xs = [max(1.0 / 60.0,
+                          (now - r["ts"]).total_seconds() / 3600.0)
+                      for r in rows]
+            else:
+                xs = [r["ts"] for r in rows]
+            if any(y == y for y in ys):  # at least one non-NaN
+                any_data = True
+            ax.plot(xs, ys, label=BROWSER_LABELS.get(b, b),
+                    color=BROWSER_COLORS.get(b),
+                    linewidth=1.5, marker=".", markersize=3)
+
+        if state["logx_time"]:
+            ax.set_xscale("log")
+            ax.invert_xaxis()  # newer (smaller dt) on the right
+            ax.set_xlabel("Hours since now (log)")
+        else:
+            ax.set_xscale("linear")
+            loc = AutoDateLocator()
+            ax.xaxis.set_major_locator(loc)
+            ax.xaxis.set_major_formatter(AutoDateFormatter(loc))
+            ax.set_xlabel("Time")
+            fig.autofmt_xdate()
+
+        ax.set_yscale("log" if state["logy"] else "linear")
+        ax.set_ylabel(label)
+        ax.grid(True, which="both", alpha=0.3)
+        if any_data:
+            ax.legend(loc="best")
+        fig.canvas.draw_idle()
+
+    cb = CheckButtons(cb_ax,
+                      ["Log Y", "Log X (since now)"],
+                      [state["logy"], state["logx_time"]])
+
+    def on_click(label_clicked: str) -> None:
+        if label_clicked == "Log Y":
+            state["logy"] = not state["logy"]
+        else:
+            state["logx_time"] = not state["logx_time"]
+        redraw()
+
+    cb.on_clicked(on_click)
+    fig._tabcount_widgets = cb  # keep widget alive
+
+    # Wrap savefig so exports (PNG/PDF/...) don't include the checkbox panel.
+    # The matplotlib toolbar's save button routes through fig.savefig().
+    original_savefig = fig.savefig
+
+    def savefig_without_widgets(*args, **kwargs):
+        kwargs.setdefault("bbox_inches", "tight")
+        cb_ax.set_visible(False)
+        try:
+            return original_savefig(*args, **kwargs)
+        finally:
+            cb_ax.set_visible(True)
+            fig.canvas.draw_idle()
+
+    fig.savefig = savefig_without_widgets
+
+    redraw()
+    return fig
+
+
 def cmd_plot(args) -> None:
     import matplotlib.pyplot as plt
-    from matplotlib.dates import AutoDateFormatter, AutoDateLocator
 
     horizon = parse_range(args.range)
     cutoff = datetime.now(timezone.utc).astimezone() - horizon
     browsers = args.browsers.split(",") if args.browsers else BROWSERS
     data = read_data_since(cutoff)
 
-    def plot_field(ax, field: str, label: str) -> None:
-        any_data = False
-        for b in browsers:
-            rows = data.get(b, [])
-            if not rows:
-                continue
-            xs = [r["ts"] for r in rows]
-            ys = [
-                r[field] if r["status"] == "ok" and r[field] is not None
-                else float("nan")
-                for r in rows
-            ]
-            if any(y == y for y in ys):  # NaN check
-                any_data = True
-            ax.plot(xs, ys, label=b, color=BROWSER_COLORS.get(b),
-                    linewidth=1.5, marker=".", markersize=3)
-        ax.set_ylabel(label)
-        ax.grid(True, alpha=0.3)
-        if any_data:
-            ax.legend(loc="upper left")
-        loc = AutoDateLocator()
-        ax.xaxis.set_major_locator(loc)
-        ax.xaxis.set_major_formatter(AutoDateFormatter(loc))
+    figs = []
+    if args.metric in ("tabs", "both"):
+        figs.append(_make_metric_figure(
+            "total_tabs", "Tabs", data, browsers))
+    if args.metric in ("windows", "both"):
+        figs.append(_make_metric_figure(
+            "windows", "Windows", data, browsers))
 
-    if args.metric == "both":
-        fig, (a1, a2) = plt.subplots(2, 1, sharex=True, figsize=(11, 6.5))
-        plot_field(a1, "total_tabs", "Tabs")
-        plot_field(a2, "windows", "Windows")
-        a2.set_xlabel("Time")
-    else:
-        fig, ax = plt.subplots(figsize=(11, 4))
-        if args.metric == "tabs":
-            plot_field(ax, "total_tabs", "Tabs")
-        else:
-            plot_field(ax, "windows", "Windows")
-        ax.set_xlabel("Time")
-
-    fig.suptitle(f"tabcount — last {args.range}")
-    fig.autofmt_xdate()
-    fig.tight_layout()
     plt.show()
 
 
@@ -468,16 +573,19 @@ def cmd_uninstall(args) -> None:
 def _maybe_reexec_under_venv() -> None:
     """If the venv exists and we're not already running under it, re-exec.
     This means `./tabcount.py` works regardless of which python invoked it,
-    once `install` has set up ~/.tabcount/venv/."""
+    once `install` has set up ~/.tabcount/venv/.
+
+    Compares sys.prefix (the venv dir when running under the venv) to
+    VENV_DIR — comparing sys.executable to venv/bin/python would falsely
+    match because venv/bin/python is a symlink to the base interpreter.
+    """
     venv_python = VENV_DIR / "bin" / "python"
     if not venv_python.exists():
         return
     try:
-        current = Path(sys.executable).resolve()
-        target = venv_python.resolve()
+        if Path(sys.prefix).resolve() == VENV_DIR.resolve():
+            return
     except OSError:
-        return
-    if current == target:
         return
     os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve()),
                                 *sys.argv[1:]])

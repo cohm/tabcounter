@@ -75,11 +75,22 @@ After that the scheduled samples will inherit the grant.
 ```sh
 tabcount status                          # print current counts, no write
 tabcount sample                          # poll once and append to today's CSV
-tabcount plot                            # interactive window, last 30 days
+tabcount plot                            # interactive — last 30 days
 tabcount plot --range 7d --metric tabs
 tabcount plot --range 24h --browsers safari,chrome
 tabcount uninstall                       # remove LaunchAgent (keeps data)
 ```
+
+By default `tabcount plot` opens **two separate windows** — one for tab
+counts, one for window counts — so each can be saved (PNG/PDF/SVG via the
+toolbar's save button) independently. Each window has two checkboxes:
+
+- **Log Y** — toggle linear/log on the y-axis live.
+- **Log X (since now)** — switch the x-axis from absolute time to
+  "hours since now" on a log scale (newer on the right). Useful for
+  expanding recent history while keeping older data on screen.
+
+Pan/zoom/save controls come from the standard matplotlib toolbar.
 
 ## Data
 
