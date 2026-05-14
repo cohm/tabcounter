@@ -1,25 +1,17 @@
 # tabcount
 
-A tiny macOS tool that polls **Safari**, **Google Chrome**, **Firefox**, and the
-**DuckDuckGo** browser every 5 minutes, records how many windows and tabs each
-has open (including per-window tab counts), and lets you view the history as
-interactive curves.
+A tiny macOS tool that polls **Safari**, **Google Chrome**, **Firefox**, and **DuckDuckGo** browsers every 5 minutes, records how many windows and tabs each
+has open (including per-window tab counts), and lets you view the history as interactive curves.
 
 ## Why
 
-To answer: "Am I actually closing tabs, or has my tab debt been growing for
-months?" — across all the browsers you use, in one place, with negligible
-overhead.
+I use tabs as a really weak todo list system, and this allows me to measure if I get better at it. Maybe you're like me and will find this helpful.
 
 ## Resource footprint
 
-- **Idle** (between samples): zero. The sampler is not a daemon; it exits
-  after each run. The LaunchAgent definition adds essentially nothing.
-- **Sampling** (every 5 min, ~1 second): ~100–300 ms of single-core CPU,
-  ~30 MB RAM peak — both released on exit. Disk I/O is a single ~1 MB
-  Firefox file read plus a ~250-byte CSV append.
-- **Plotting** (`tabcount plot`, on demand): a few hundred MB and 1–3 s
-  while matplotlib loads, then idle until you close the window.
+- **Idle** (between samples): zero. The sampler is not a daemon; it exits after each run. The LaunchAgent definition adds essentially nothing.
+- **Sampling** (every 5 min, ~1 second): ~100–300 ms of single-core CPU, ~30 MB RAM peak — both released on exit. Disk I/O is a single ~1 MB Firefox file read plus a ~250-byte CSV append.
+- **Plotting** (`tabcount plot`, on demand): a few hundred MB and 1–3 s while matplotlib loads, then idle until you close the window.
 
 ## How it polls
 
@@ -28,8 +20,7 @@ overhead.
 | Safari, Chrome, DuckDuckGo | AppleScript via `osascript` (no app launch — only queries running browsers) |
 | Firefox | Read `sessionstore.jsonlz4` from the profile directly (`mozLz40` + LZ4 block) |
 
-The sampler **never launches a browser**. If a browser isn't running, the row
-is recorded as `not_running`.
+The sampler **never launches a browser**. If a browser isn't running, the row is recorded as `not_running`.
 
 ## Install
 
@@ -49,8 +40,7 @@ The script re-execs itself under the venv python on every run, so invoking
 
 ### Optional: a shell alias
 
-To call it `tabcount` from anywhere without changing `$PATH`, add this line
-to `~/.zshrc`:
+To call it `tabcount` from anywhere without changing `$PATH`, add this line to `~/.zshrc`:
 
 ```sh
 alias tabcount='/Users/cohm/Documents/Work/Computing/Projects/tabcounter/tabcount.py'
@@ -58,9 +48,7 @@ alias tabcount='/Users/cohm/Documents/Work/Computing/Projects/tabcounter/tabcoun
 
 ### First-run permission grants
 
-The first time the sampler queries Safari, Chrome, or DuckDuckGo, macOS will
-prompt to allow automation. Run it from a Terminal once so the prompts appear
-visibly and you can click *OK*:
+The first time the sampler queries Safari, Chrome, or DuckDuckGo, macOS will prompt to allow automation. Run it from a Terminal once so the prompts appear visibly and you can click *OK*:
 
 ```sh
 ./tabcount.py status
@@ -81,37 +69,21 @@ tabcount plot --range 24h --browsers safari,chrome
 tabcount uninstall                       # remove LaunchAgent (keeps data)
 ```
 
-By default `tabcount plot` opens **two separate windows** — one for tab
-counts, one for window counts — so each can be saved (PNG/PDF/SVG via the
+By default `tabcount plot` opens **two separate windows** — one for tab counts, one for window counts — so each can be saved (PNG/PDF/SVG via the
 toolbar's save button) independently. Each window has four checkboxes:
 
 - **Log Y** — toggle linear/log on the primary y-axis live.
-- **Log X (since now)** — switch the x-axis from absolute time to
-  "hours since now" on a log scale (newer on the right). Useful for
-  expanding recent history while keeping older data on screen.
-- **Memory (%)** — overlay per-browser memory on a right y-axis as
-  percent of total system RAM (0–100 range).
-- **Memory (GB)** — same overlay, but absolute GB with autoscaling.
-  Mutually exclusive with Memory (%).
+- **Log X (since now)** — switch the x-axis from absolute time to "hours since now" on a log scale (newer on the right). Useful for expanding recent history while keeping older data on screen.
+- **Memory (%)** — overlay per-browser memory on a right y-axis as percent of total system RAM (0–100 range).
+- **Memory (GB)** — same overlay, but absolute GB with autoscaling. Mutually exclusive with Memory (%).
 
-Memory comes from summing RSS across each browser's renderer/helper
-subprocesses. Chrome and Firefox are precise (their helpers are real
-children of the main app, found by a process-tree walk). Safari and
-DuckDuckGo are approximate: WebKit content/networking/GPU XPC services
-are launchd-spawned (not children), so they're matched by name and
-attributed by which WebKit-using browser is running — if both Safari and
-DDG are running, the WebKit total is split by main-app RSS ratio. Other
-WebKit-using apps (Mail, Messages) cause a small overcount. RSS itself
-double-counts shared memory pages. Trends are accurate; absolute numbers
-are within ±20–30 % of Activity Monitor's "Memory" column.
+Memory comes from summing RSS across each browser's renderer/helper subprocesses. Chrome and Firefox are precise (their helpers are real children of the main app, found by a process-tree walk). Safari and DuckDuckGo are approximate: WebKit content/networking/GPU XPC services are launchd-spawned (not children), so they're matched by name and attributed by which WebKit-using browser is running — if both Safari and DDG are running, the WebKit total is split by main-app RSS ratio. Other WebKit-using apps (Mail, Messages) cause a small overcount. RSS itself double-counts shared memory pages. Trends are accurate; absolute numbers are within ±20–30 % of Activity Monitor's "Memory" column.
 
-Pan/zoom/save controls come from the standard matplotlib toolbar. The
-checkbox panel is hidden automatically when saving (PNG/PDF/SVG).
+Pan/zoom/save controls come from the standard matplotlib toolbar. The checkbox panel is hidden automatically when saving (PNG/PDF/SVG).
 
 ## Data
 
-CSV under `~/.tabcount/data/YYYY-MM.csv`, one file per calendar month,
-gzipped after the month rolls over.
+CSV under `~/.tabcount/data/YYYY-MM.csv`, one file per calendar month, gzipped after the month rolls over.
 
 ```
 ts,browser,status,windows,total_tabs,tabs_per_window
@@ -121,22 +93,16 @@ ts,browser,status,windows,total_tabs,tabs_per_window
 2026-05-14T10:05:00+02:00,duckduckgo,ok,2,9,5|4
 ```
 
-`tabs_per_window` preserves the per-window breakdown so you can reconstruct
-the full distribution; `windows`/`total_tabs` are kept as explicit columns
-for grep/awk convenience.
+`tabs_per_window` preserves the per-window breakdown so you can reconstruct the full distribution; `windows`/`total_tabs` are kept as explicit columns for grep/awk convenience.
 
 Expect ≈22 MB/year raw, ≈2–3 MB/year after gzip rollover.
 
 ## Troubleshooting
 
-- **Empty CSV after install** — the launchd-spawned process may not have
-  automation permission. Run `tabcount status` from Terminal, click *OK* on
+- **Empty CSV after install** — the launchd-spawned process may not have automation permission. Run `tabcount status` from Terminal, click *OK* on
   prompts. Check `~/.tabcount/tabcount.log` for errors.
-- **Firefox always `not_running`** — the script ignores stale
-  `sessionstore.jsonlz4` files older than an hour when Firefox isn't running.
-- **DuckDuckGo shows `0 tabs in N window(s)`** — DDG's AppleScript surface
-  doesn't always expose tabs; the script falls back to UI scripting which
-  only gives a window count. The data still records windows correctly.
+- **Firefox always `not_running`** — the script ignores stale `sessionstore.jsonlz4` files older than an hour when Firefox isn't running.
+- **DuckDuckGo shows `0 tabs in N window(s)`** — DDG's AppleScript surface doesn't always expose tabs; the script falls back to UI scripting which only gives a window count. The data still records windows correctly.
 
 ## License
 
